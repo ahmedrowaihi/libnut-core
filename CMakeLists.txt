@@ -52,7 +52,7 @@ set(INCLUDES "")
 
 if (UNIX AND APPLE)
     message(STATUS "macOS build")
-    list(APPEND LIBS "-framework ApplicationServices" "-framework Cocoa")
+    list(APPEND LIBS "-framework ApplicationServices" "-framework Cocoa" "-framework ScreenCaptureKit")
 elseif (WIN32)
     message(STATUS "Windows build")
 elseif (UNIX AND NOT APPLE)

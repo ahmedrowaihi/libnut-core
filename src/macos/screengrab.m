@@ -2,87 +2,121 @@
 #include "../endian.h"
 #include <stdlib.h> /* malloc() */
 
-#include <ApplicationServices/ApplicationServices.h>
+#import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <Cocoa/Cocoa.h>
 
-static double getPixelDensity() {
-    @autoreleasepool
-    {
-        NSScreen * mainScreen = [NSScreen
-        mainScreen];
-        if (mainScreen) {
-            return mainScreen.backingScaleFactor;
-        } else {
-            return 1.0;
+@interface SCStreamDelegate : NSObject <SCStreamDelegate, SCStreamOutput>
+@property (nonatomic, strong) dispatch_semaphore_t semaphore;
+@property (nonatomic, assign) MMBitmapRef bitmap;
+@end
+
+@implementation SCStreamDelegate
+
+- (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
+    if (type == SCStreamOutputTypeScreen) {
+        CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+        
+        if (imageBuffer) {
+            CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+            
+            size_t bytesPerRow = CVPixelBufferGetBytesPerRow(imageBuffer);
+            size_t height = CVPixelBufferGetHeight(imageBuffer);
+            void *src = CVPixelBufferGetBaseAddress(imageBuffer);
+            size_t bufferSize = bytesPerRow * height;
+            
+            uint8_t *buffer = malloc(bufferSize);
+            memcpy(buffer, src, bufferSize);
+            
+            self.bitmap = createMMBitmap(buffer,
+                                       CVPixelBufferGetWidth(imageBuffer),
+                                       height,
+                                       bytesPerRow,
+                                       32,  // BGRA format
+                                       4);
+            
+            CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
         }
+        
+        dispatch_semaphore_signal(self.semaphore);
+    }
+}
+
+@end
+
+static double getPixelDensity() {
+    @autoreleasepool {
+        NSScreen *mainScreen = [NSScreen mainScreen];
+        return mainScreen ? mainScreen.backingScaleFactor : 1.0;
     }
 }
 
 MMBitmapRef copyMMBitmapFromDisplayInRect(MMRect rect) {
-
-    CGDirectDisplayID displayID = CGMainDisplayID();
-
-    CGImageRef image = CGDisplayCreateImageForRect(displayID,
-                                                   CGRectMake(
-                                                           rect.origin.x,
-                                                           rect.origin.y,
-                                                           rect.size.width,
-                                                           rect.size.height
-                                                   )
-    );
-
-    if (!image) { return NULL; }
-
-    CFDataRef imageData = CGDataProviderCopyData(CGImageGetDataProvider(image));
-
-    if (!imageData) { return NULL; }
-
-    long bufferSize = CFDataGetLength(imageData);
-    size_t bytesPerPixel = (size_t) (CGImageGetBitsPerPixel(image) / 8);
-    double pixelDensity = getPixelDensity();
-    long expectedBufferSize = rect.size.width * pixelDensity * rect.size.height * pixelDensity * bytesPerPixel;
-
-    if (expectedBufferSize < bufferSize) {
-        size_t reportedByteWidth = CGImageGetBytesPerRow(image);
-        size_t expectedByteWidth = expectedBufferSize / (rect.size.height * pixelDensity);
-
-        uint8_t *buffer = malloc(expectedBufferSize);
-
-        const uint8_t *dataPointer = CFDataGetBytePtr(imageData);
-        size_t parts = bufferSize / reportedByteWidth;
-
-        for (size_t idx = 0; idx < parts - 1; ++idx) {
-            memcpy(buffer + (idx * expectedByteWidth),
-                   dataPointer + (idx * reportedByteWidth),
-                   expectedByteWidth
-            );
+    __block MMBitmapRef bitmap = NULL;
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    
+    @autoreleasepool {
+        CGDirectDisplayID displayID = CGMainDisplayID();
+        __block SCDisplay *display = nil;
+        __block NSArray<SCDisplay *> *displays = nil;
+        __block SCShareableContent *content = nil;
+        __block NSError *error = nil;
+        
+        dispatch_semaphore_t contentSemaphore = dispatch_semaphore_create(0);
+        [SCShareableContent getCurrentContentsWithCompletionHandler:^(SCShareableContent * _Nullable shareableContent, NSError * _Nullable contentError) {
+            content = shareableContent;
+            error = contentError;
+            dispatch_semaphore_signal(contentSemaphore);
+        }];
+        dispatch_semaphore_wait(contentSemaphore, DISPATCH_TIME_FOREVER);
+        
+        if (error || !content) {
+            return NULL;
         }
-
-        MMBitmapRef bitmap = createMMBitmap(buffer,
-                                            rect.size.width * pixelDensity,
-                                            rect.size.height * pixelDensity,
-                                            expectedByteWidth,
-                                            CGImageGetBitsPerPixel(image),
-                                            CGImageGetBitsPerPixel(image) / 8);
-
-        CFRelease(imageData);
-        CGImageRelease(image);
-
-        return bitmap;
-    } else {
-        uint8_t *buffer = malloc(bufferSize);
-        CFDataGetBytes(imageData, CFRangeMake(0, bufferSize), buffer);
-        MMBitmapRef bitmap = createMMBitmap(buffer,
-                                            CGImageGetWidth(image),
-                                            CGImageGetHeight(image),
-                                            CGImageGetBytesPerRow(image),
-                                            CGImageGetBitsPerPixel(image),
-                                            CGImageGetBitsPerPixel(image) / 8);
-
-        CFRelease(imageData);
-
-        CGImageRelease(image);
-
-        return bitmap;
+        
+        displays = content.displays;
+        
+        for (SCDisplay *scDisplay in displays) {
+            if (scDisplay.displayID == displayID) {
+                display = scDisplay;
+                break;
+            }
+        }
+        
+        if (!display) {
+            return NULL;
+        }
+        
+        SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
+        
+        SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
+        config.width = (size_t)rect.size.width;
+        config.height = (size_t)rect.size.height;
+        config.pixelFormat = kCVPixelFormatType_32BGRA;
+        
+        SCStreamDelegate *delegate = [[SCStreamDelegate alloc] init];
+        delegate.semaphore = semaphore;
+        
+        SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:delegate];
+        
+        NSError *handlerError = nil;
+        [stream addStreamOutput:delegate type:SCStreamOutputTypeScreen sampleHandlerQueue:dispatch_get_main_queue() error:&handlerError];
+        
+        if (handlerError) {
+            return NULL;
+        }
+        
+        [stream startCaptureWithCompletionHandler:^(NSError * _Nullable error) {
+            if (error) {
+                dispatch_semaphore_signal(semaphore);
+            }
+        }];
+        
+        dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+        
+        bitmap = delegate.bitmap;
+        
+        [stream stopCaptureWithCompletionHandler:^(NSError * _Nullable error) {}];
     }
+    
+    return bitmap;
 }
